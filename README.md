@@ -1,0 +1,1 @@
+# Star_sklad_lastversion
