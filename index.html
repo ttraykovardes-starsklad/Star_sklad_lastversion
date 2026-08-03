@@ -252,11 +252,25 @@ async function saveComment(key,text){
   ST.comments[key]=text;
   gsPost({action:'saveComment',key,text,author:'колега'});
 }
-async function saveUploadToSheets(pm,week,filename,rows){
+const SHEET_CHUNK=400;
+// Записва в Google Sheets на парчета, ПОСЛЕДОВАТЕЛНО и с изчакване.
+// Връща {ok:true} или {ok:false,error:'...'} за да знаем реално ли е записано.
+async function saveWeekToSheets(pm,week,filename,rows){
   ST.uploadLog[pm]={ts:Date.now(),file:filename,week};
-  gsPost({action:'saveUploadLog',pm,week,file:filename});
-  gsPost({action:'saveWeekData',pm,week,rows});
+  try{
+    const list=rows||[];
+    const total=Math.max(1,Math.ceil(list.length/SHEET_CHUNK));
+    for(let c=0;c<total;c++){
+      const chunk=list.slice(c*SHEET_CHUNK,(c+1)*SHEET_CHUNK);
+      const r=await gsPost({action:'saveWeekData',pm,week,rows:chunk,chunkIdx:c,chunkTotal:total});
+      if(!r||!r.ok)return{ok:false,error:(r&&r.error)||'няма отговор от Sheets'};
+    }
+    const lg=await gsPost({action:'saveUploadLog',pm,week,file:filename});
+    if(!lg||!lg.ok)return{ok:false,error:'логът не се записа'};
+    return{ok:true};
+  }catch(e){return{ok:false,error:e.message};}
 }
+function saveUploadToSheets(pm,week,filename,rows){return saveWeekToSheets(pm,week,filename,rows);}
 // Load all SKU links from local JSON file (loaded once, cached)
 let SKU_LINKS_LOADED = false;
 let SKU_LINKS_LOADING = null;
@@ -820,7 +834,7 @@ function uploadWeek(pm,input){
   if(label){const wn=parseInt(label.replace('W',''));if(wn===13)label='W13 - Q1';else if(wn===26)label='W26 - Q2';else if(wn===39)label='W39 - Q3';else if(wn===52)label='W52 - Q4';}
   if(!label){input.value='';return;}
   const rd=new FileReader();
-  rd.onload=e=>{
+  rd.onload=async e=>{
     try{
       const wb=XLSX.read(e.target.result,{type:'array'});
       const ws=wb.Sheets[wb.SheetNames[0]];
@@ -846,14 +860,20 @@ function uploadWeek(pm,input){
         if(!byPm[p])byPm[p]=[];
         byPm[p].push([safe(sku),safe(grp),safe(String(r[iN]||'').trim().slice(0,55)),qty,tf(r[iV]),'','','']);
       }
-      for(const[p,rows] of Object.entries(byPm)){
+      const pmEntries=Object.entries(byPm);
+      for(const[p,rows] of pmEntries){
         if(!ST.extraWeeks[p])ST.extraWeeks[p]={};
         ST.extraWeeks[p][label]=rows;
-        saveUploadToSheets(p,label,file.name,rows);
       }
-      // Cache extraWeeks in localStorage
       try{localStorage.setItem('ss_extra',JSON.stringify(ST.extraWeeks));}catch(e){console.warn('localStorage full:',e);}
       ST.viewFrom=null;showPm(pm);
+      // Запис в Sheets един по един, с изчакване
+      let okCount=0;const failed=[];
+      for(const[p,rows] of pmEntries){
+        const res=await saveWeekToSheets(p,label,file.name,rows);
+        if(res.ok)okCount++;else{failed.push(p);console.warn('Sheets fail',p,res.error);}
+      }
+      showToast(failed.length?('\u26A0 '+failed.length+' ПМ не се записаха: '+failed.join(', ')):('\u2713 '+label+' синхронизирано ('+okCount+' ПМ)'));
     }catch(err){alert('Грешка: '+err.message);}
   };
   rd.readAsArrayBuffer(file);input.value='';
@@ -960,7 +980,7 @@ function settingsUpload(input){
   if(label){const wn=parseInt(label.replace('W',''));if(wn===13)label='W13 - Q1';else if(wn===26)label='W26 - Q2';else if(wn===39)label='W39 - Q3';else if(wn===52)label='W52 - Q4';}
   if(!label){input.value='';if(lbl)lbl.textContent='Пусни Excel файл или кликни';return;}
   const rd=new FileReader();
-  rd.onload=e=>{
+  rd.onload=async e=>{
     try{
       const wb=XLSX.read(e.target.result,{type:'array'});
       const ws=wb.Sheets[wb.SheetNames[0]];
@@ -986,20 +1006,28 @@ function settingsUpload(input){
         if(!byPm[p])byPm[p]=[];
         byPm[p].push([safe(sku),safe(grp),safe(String(r[iN]||'').trim().slice(0,55)),qty,tf(r[iV]),'','','']);
       }
-      let updated=[];
-      for(const[p,rows] of Object.entries(byPm)){
+      const pmEntries=Object.entries(byPm);
+      // 1) локално състояние веднага, за да е бърз интерфейсът
+      for(const[p,rows] of pmEntries){
         if(!ST.extraWeeks[p])ST.extraWeeks[p]={};
         ST.extraWeeks[p][label]=rows;
-        saveUploadToSheets(p,label,file.name,rows);
-        updated.push(p+':'+rows.length);
       }
-      if(lbl)lbl.textContent='✓ '+label+' заредено — '+updated.join(', ');
-      input.value='';
-      // Cache extraWeeks in localStorage
       try{localStorage.setItem('ss_extra',JSON.stringify(ST.extraWeeks));}catch(e){}
-      // Refresh dashboard with new data
+      input.value='';
       if(ST.view==='home')showHome();
       else if(ST.view==='admin')showAdmin();
+      // 2) после в Google Sheets — ЕДИН ПО ЕДИН, за да не се губят заявки
+      let okCount=0;const failed=[];
+      for(let i=0;i<pmEntries.length;i++){
+        const p=pmEntries[i][0],rows=pmEntries[i][1];
+        if(lbl)lbl.textContent='Записване в Sheets… '+(i+1)+'/'+pmEntries.length+' ('+p+')';
+        const res=await saveWeekToSheets(p,label,file.name,rows);
+        if(res.ok)okCount++;else{failed.push(p);console.warn('Sheets fail',p,res.error);}
+      }
+      if(lbl)lbl.textContent=failed.length
+        ? '\u26A0 '+label+': записани '+okCount+'/'+pmEntries.length+' — проблем при: '+failed.join(', ')
+        : '\u2713 '+label+' записано в Sheets за всички '+okCount+' ПМ — колегите ще го видят';
+      showToast(failed.length?('\u26A0 '+failed.length+' ПМ не се записаха в Sheets'):('\u2713 '+label+' синхронизирано'));
     }catch(err){alert('Грешка: '+err.message);if(lbl)lbl.textContent='Грешка';}
   };
   rd.readAsArrayBuffer(file);
@@ -1023,7 +1051,7 @@ function importCompPrices(input){
   const file=input.files[0];if(!file)return;
   const lbl=document.getElementById('comp-lbl');if(lbl)lbl.textContent='Зареждане...';
   const rd=new FileReader();
-  rd.onload=e=>{
+  rd.onload=async e=>{
     try{
       const wb=XLSX.read(e.target.result,{type:'array'});
       const ws=wb.Sheets[wb.SheetNames[0]];
@@ -1057,8 +1085,11 @@ function importCompPrices(input){
       try{localStorage.setItem('ss_comp',JSON.stringify(ST.compPrices));localStorage.setItem('ss_comp_ts',ST.compPricesTs);}catch(e){}
       if(lbl)lbl.textContent='✓ '+count+' цени';
       showToast('✓ '+count+' конкурентни цени заредени');
-      // Save to Google Sheets
-      saveCompPricesToSheets(ST.compPrices);
+      // Save to Google Sheets (последователно, с реален статус)
+      const cres=await saveCompPricesToSheets(ST.compPrices);
+      if(lbl)lbl.textContent=cres&&cres.ok
+        ?('\u2713 '+count+' цени — записани в Sheets')
+        :('\u26A0 '+count+' цени локално, но НЕ в Sheets: '+((cres&&cres.error)||'?'));
       if(ST.view==='pm'&&ST.prevPm)showPm(ST.prevPm);
       input.value='';
     }catch(err){console.error('importCompPrices error:',err);showToast('✗ '+err.message);if(lbl)lbl.textContent='Грешка: '+err.message.slice(0,30);}
@@ -1066,19 +1097,19 @@ function importCompPrices(input){
   rd.readAsArrayBuffer(file);
 }
 
-function saveCompPricesToSheets(prices){
-  if(!SCRIPT_URL)return;
-  // Save in chunks of 1000 to avoid payload limits
+async function saveCompPricesToSheets(prices){
+  if(!SCRIPT_URL)return{ok:false,error:'няма SCRIPT_URL'};
   const entries=Object.entries(prices);
   const chunks=[];
   for(let i=0;i<entries.length;i+=1000)chunks.push(Object.fromEntries(entries.slice(i,i+1000)));
-  chunks.forEach((chunk,idx)=>{
-    fetch(SCRIPT_URL,{
-      method:'POST',
-      headers:{'Content-Type':'text/plain'},
-      body:JSON.stringify({action:'saveCompPrices',chunk,idx,total:chunks.length})
-    }).catch(e=>console.warn('saveComp err',e));
-  });
+  const lbl=document.getElementById('comp-lbl');
+  // ВАЖНО: последователно — парче 0 чисти листа и трябва да е първо
+  for(let idx=0;idx<chunks.length;idx++){
+    if(lbl)lbl.textContent='Записване в Sheets… '+(idx+1)+'/'+chunks.length;
+    const r=await gsPost({action:'saveCompPrices',chunk:chunks[idx],idx,total:chunks.length});
+    if(!r||!r.ok)return{ok:false,error:(r&&r.error)||'няма отговор',at:idx};
+  }
+  return{ok:true,chunks:chunks.length};
 }
 
 // ── EXPORT / IMPORT COMMENTS ───────────────────────────────
